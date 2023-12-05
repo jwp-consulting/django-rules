@@ -3,7 +3,9 @@ import operator
 import threading
 from functools import partial, update_wrapper
 from inspect import getfullargspec, isfunction, ismethod
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union, overload
+
+from .types import PredicateFunction, RulesUser
 
 logger = logging.getLogger("rules")
 
@@ -115,7 +117,7 @@ class Predicate(object):
     def __str__(self) -> str:
         return self.name
 
-    def __call__(self, *args, **kwargs) -> Any:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         # this method is defined as variadic in order to not mask the
         # underlying callable's signature that was most likely decorated
         # as a predicate. internally we consistently call ``_apply`` that
@@ -173,26 +175,26 @@ class Predicate(object):
         finally:
             _context.stack.pop()
 
-    def __and__(self, other) -> "Predicate":
-        def AND(*args):
+    def __and__(self, other: Predicate) -> "Predicate":
+        def AND(*args: Any) -> Optional[bool]:
             return self._combine(other, operator.and_, args)
 
         return type(self)(AND, "(%s & %s)" % (self.name, other.name))
 
-    def __or__(self, other) -> "Predicate":
-        def OR(*args):
+    def __or__(self, other: Predicate) -> "Predicate":
+        def OR(*args: Any) -> Optional[bool]:
             return self._combine(other, operator.or_, args)
 
         return type(self)(OR, "(%s | %s)" % (self.name, other.name))
 
-    def __xor__(self, other) -> "Predicate":
-        def XOR(*args):
+    def __xor__(self, other: Predicate) -> "Predicate":
+        def XOR(*args: Any) -> Optional[bool]:
             return self._combine(other, operator.xor, args)
 
         return type(self)(XOR, "(%s ^ %s)" % (self.name, other.name))
 
     def __invert__(self) -> "Predicate":
-        def INVERT(*args):
+        def INVERT(*args: Any) -> Optional[bool]:
             result = self._apply(*args)
             return None if result is None else not result
 
@@ -202,7 +204,12 @@ class Predicate(object):
             name = "~" + self.name
         return type(self)(INVERT, name)
 
-    def _combine(self, other, op, args):
+    def _combine(
+        self,
+        other: Predicate,
+        op: Callable[..., Optional[bool]],
+        args: Sequence[Any],
+    ) -> Optional[bool]:
         self_result = self._apply(*args)
         if self_result is None:
             return other._apply(*args)
@@ -216,10 +223,12 @@ class Predicate(object):
         other_result = other._apply(*args)
         if other_result is None:
             return self_result
+        # We ignore the following type errors
+        # error: operator.__or__? not callable  [misc]
+        # error: operator.__and__? not callable  [misc]
+        return op(self_result, other_result)  # type: ignore[misc]
 
-        return op(self_result, other_result)
-
-    def _apply(self, *args) -> Optional[bool]:
+    def _apply(self, *args: Any) -> Optional[bool]:
         # Internal method that is used to invoke the predicate with the
         # proper number of positional arguments, inside the current
         # invocation context.
@@ -239,7 +248,27 @@ class Predicate(object):
         return result
 
 
-def predicate(fn=None, name=None, **options):
+@overload
+def predicate(
+    fn: PredicateFunction, name: Optional[str] = None, **options: Any
+) -> Predicate:
+    ...
+
+
+@overload
+def predicate(
+    *,
+    name: str,
+    **options: Any,
+) -> Callable[[PredicateFunction], Predicate]:
+    ...
+
+
+def predicate(
+    fn: Optional[Union[str, PredicateFunction]] = None,
+    name: Optional[str] = None,
+    **options: Any,
+) -> Union[Predicate, Callable[[PredicateFunction], Predicate]]:
     """
     Decorator that constructs a ``Predicate`` instance from any function::
 
@@ -257,7 +286,7 @@ def predicate(fn=None, name=None, **options):
         name = fn
         fn = None
 
-    def inner(fn):
+    def inner(fn: Union[Predicate, PredicateFunction]) -> Predicate:
         if isinstance(fn, Predicate):
             return fn
         p = Predicate(fn, name, **options)
@@ -279,12 +308,12 @@ always_allow = predicate(lambda: True, name="always_allow")
 always_deny = predicate(lambda: False, name="always_deny")
 
 
-def is_bool_like(obj) -> bool:
+def is_bool_like(obj: Any) -> bool:
     return hasattr(obj, "__bool__") or hasattr(obj, "__nonzero__")
 
 
 @predicate
-def is_authenticated(user) -> bool:
+def is_authenticated(user: RulesUser) -> bool:
     if not hasattr(user, "is_authenticated"):
         return False  # not a user model
     if not is_bool_like(user.is_authenticated):  # pragma: no cover
@@ -294,27 +323,27 @@ def is_authenticated(user) -> bool:
 
 
 @predicate
-def is_superuser(user) -> bool:
+def is_superuser(user: RulesUser) -> bool:
     if not hasattr(user, "is_superuser"):
         return False  # swapped user model, doesn't support is_superuser
     return user.is_superuser
 
 
 @predicate
-def is_staff(user) -> bool:
+def is_staff(user: RulesUser) -> bool:
     if not hasattr(user, "is_staff"):
         return False  # swapped user model, doesn't support is_staff
     return user.is_staff
 
 
 @predicate
-def is_active(user) -> bool:
+def is_active(user: RulesUser) -> bool:
     if not hasattr(user, "is_active"):
         return False  # swapped user model, doesn't support is_active
     return user.is_active
 
 
-def is_group_member(*groups) -> Callable[..., Any]:
+def is_group_member(*groups: str) -> Callable[..., Any]:
     assert len(groups) > 0, "You must provide at least one group name"
 
     if len(groups) > 3:
@@ -325,7 +354,7 @@ def is_group_member(*groups) -> Callable[..., Any]:
     name = "is_group_member:%s" % ",".join(g)
 
     @predicate(name)
-    def fn(user) -> bool:
+    def fn(user: RulesUser) -> bool:
         if not hasattr(user, "groups"):
             return False  # swapped user model, doesn't support groups
         if not hasattr(user, "_group_names_cache"):  # pragma: no cover
